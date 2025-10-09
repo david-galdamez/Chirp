@@ -1,12 +1,19 @@
 package main
 
 import (
+	"database/sql"
+	"david-galdamez/chirp/internal/auth"
 	"david-galdamez/chirp/internal/database"
+	"david-galdamez/chirp/models"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"sync/atomic"
+
+	"github.com/google/uuid"
 )
 
 type apiConfig struct {
@@ -33,13 +40,30 @@ func (cfg *apiConfig) serveMetrics(w http.ResponseWriter, r *http.Request) {
 }
 
 func (cfg *apiConfig) resetMetric(w http.ResponseWriter, r *http.Request) {
-	cfg.fileserverHits.Store(0)
+	platform := os.Getenv("PLATFORM")
+	if platform != "dev" {
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
+
+	err := cfg.queries.DeleteUsers(r.Context())
+	if err != nil {
+		w.Header().Add("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`"error" : "Internal server error"`))
+		return
+	}
+
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("Hits reset to 0"))
 }
 
-func (cfg *apiConfig) validateChirp(w http.ResponseWriter, r *http.Request) {
-	request := ValidateRequest{}
+type ChirpRequest struct {
+	Body   string    `json:"body"`
+	UserId uuid.UUID `json:"user_id"`
+}
+
+func (cfg *apiConfig) createChirp(w http.ResponseWriter, r *http.Request) {
+	request := ChirpRequest{}
 
 	decoder := json.NewDecoder(r.Body)
 	err := decoder.Decode(&request)
@@ -67,10 +91,234 @@ func (cfg *apiConfig) validateChirp(w http.ResponseWriter, r *http.Request) {
 		request.Body = strings.ReplaceAll(request.Body, strings.ToUpper(word), "****")
 	}
 
-	okRes := OkResponse{CleanedBody: request.Body}
-	data, _ := json.Marshal(okRes)
+	chirpDb, err := cfg.queries.CreateChirp(r.Context(), database.CreateChirpParams{
+		Body:   request.Body,
+		UserID: request.UserId,
+	})
+	if err != nil {
+		w.Header().Add("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`"error" : "Error creating chirp"`))
+		return
+	}
+
+	chirp := models.Chirp{
+		ID:        chirpDb.ID,
+		CreatedAt: chirpDb.CreatedAt,
+		UpdatedAt: chirpDb.UpdatedAt,
+		Body:      chirpDb.Body,
+		UserId:    chirpDb.UserID,
+	}
+
+	data, err := json.Marshal(chirp)
+	if err != nil {
+		w.Header().Add("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`"error" : "Internal server error"`))
+		return
+	}
 
 	w.Header().Add("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	w.Write(data)
+}
+
+type UserRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+func (cfg *apiConfig) createUser(w http.ResponseWriter, r *http.Request) {
+	request := UserRequest{}
+
+	decoder := json.NewDecoder(r.Body)
+	err := decoder.Decode(&request)
+	if err != nil {
+		w.Header().Add("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`"error" : "Bad request"`))
+		return
+	}
+
+	hashedPassword, err := auth.HashPassword(request.Password)
+	if err != nil {
+		w.Header().Add("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`"error" : "Error hashing password"`))
+		return
+	}
+
+	userDatabase, err := cfg.queries.CreateUser(r.Context(), database.CreateUserParams{
+		Email:          request.Email,
+		HashedPassword: hashedPassword,
+	})
+	if err != nil {
+		w.Header().Add("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`"error" : "Error creating user"`))
+		return
+	}
+
+	user := models.User{
+		ID:        userDatabase.ID,
+		CreatedAt: userDatabase.CreatedAt,
+		UpdatedAt: userDatabase.UpdatedAt,
+		Email:     userDatabase.Email,
+	}
+
+	jsonResponse, err := json.Marshal(user)
+	if err != nil {
+		w.Header().Add("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`"error" : "Internal server error"`))
+		return
+	}
+
+	w.Header().Add("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	w.Write(jsonResponse)
+}
+
+func (cfg *apiConfig) loginUser(w http.ResponseWriter, r *http.Request) {
+	request := UserRequest{}
+
+	decoder := json.NewDecoder(r.Body)
+	err := decoder.Decode(&request)
+	if err != nil {
+		w.Header().Add("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`"error" : "Bad request"`))
+		return
+	}
+
+	userDB, err := cfg.queries.GetUser(r.Context(), request.Email)
+	if err != nil {
+		if errors.Is(sql.ErrNoRows, err) {
+			w.Header().Add("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte(`"error": "Chirp not found"`))
+			return
+		}
+
+		w.Header().Add("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`"error" : "Incorrect email or password"`))
+		return
+	}
+
+	isPassword, err := auth.CheckPasswordHash(request.Password, userDB.HashedPassword)
+	if err != nil {
+		w.Header().Add("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`"error" : "Internal server error"`))
+		return
+	}
+
+	if !isPassword {
+		w.Header().Add("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`"error" : "Incorrect email or password"`))
+		return
+	}
+
+	user := models.User{
+		ID:        userDB.ID,
+		CreatedAt: userDB.CreatedAt,
+		UpdatedAt: userDB.UpdatedAt,
+		Email:     userDB.Email,
+	}
+
+	jsonRes, err := json.Marshal(user)
+	if err != nil {
+		w.Header().Add("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`"error" : "Internal server error"`))
+		return
+	}
+
+	w.Header().Add("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write(jsonRes)
+}
+
+func (cfg *apiConfig) getChirps(w http.ResponseWriter, r *http.Request) {
+	chirpsDB, err := cfg.queries.GetChirps(r.Context())
+	if err != nil {
+		w.Header().Add("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`"error" : "Internal server error"`))
+		return
+	}
+
+	chirps := []models.Chirp{}
+	for _, chirp := range chirpsDB {
+		newChirp := models.Chirp{
+			ID:        chirp.ID,
+			CreatedAt: chirp.CreatedAt,
+			UpdatedAt: chirp.UpdatedAt,
+			Body:      chirp.Body,
+			UserId:    chirp.UserID,
+		}
+
+		chirps = append(chirps, newChirp)
+	}
+
+	jsonRes, err := json.Marshal(chirps)
+	if err != nil {
+		w.Header().Add("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`"error" : "Internal server error"`))
+		return
+	}
+
+	w.Header().Add("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write(jsonRes)
+}
+
+func (cfg *apiConfig) getChirp(w http.ResponseWriter, r *http.Request) {
+	chirpId := r.PathValue("chirpID")
+	if chirpId == "" {
+		w.Header().Add("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`"error": "Id is not valid"`))
+		return
+	}
+
+	parsedId := uuid.MustParse(chirpId)
+
+	chirpDb, err := cfg.queries.GetChirp(r.Context(), parsedId)
+	if err != nil {
+		if errors.Is(sql.ErrNoRows, err) {
+			w.Header().Add("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte(`"error": "Chirp not found"`))
+			return
+		}
+
+		w.Header().Add("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`"error" : "Internal server error"`))
+		return
+	}
+
+	chirp := models.Chirp{
+		ID:        chirpDb.ID,
+		CreatedAt: chirpDb.CreatedAt,
+		UpdatedAt: chirpDb.UpdatedAt,
+		Body:      chirpDb.Body,
+		UserId:    chirpDb.UserID,
+	}
+
+	jsonRes, err := json.Marshal(chirp)
+	if err != nil {
+		w.Header().Add("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`"error" : "Internal server error"`))
+		return
+	}
+
+	w.Header().Add("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write(jsonRes)
 }
