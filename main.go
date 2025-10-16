@@ -34,9 +34,15 @@ func main() {
 
 	dbQueries := database.New(db)
 
+	secretKey := os.Getenv("SECRET_KEY")
+	if secretKey == "" {
+		log.Fatalf("Secret key not found")
+	}
+
 	apiCfg := apiConfig{
 		fileserverHits: atomic.Int32{},
 		queries:        dbQueries,
+		secretKey:      secretKey,
 	}
 
 	mux.Handle("/api/app/", apiCfg.middlewareMetricsInc(http.StripPrefix("/app", http.FileServer(http.Dir(".")))))

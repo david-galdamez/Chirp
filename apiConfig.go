@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -19,6 +20,7 @@ import (
 type apiConfig struct {
 	fileserverHits atomic.Int32
 	queries        *database.Queries
+	secretKey      string
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -63,10 +65,26 @@ type ChirpRequest struct {
 }
 
 func (cfg *apiConfig) createChirp(w http.ResponseWriter, r *http.Request) {
+	token, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		w.Header().Add("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error": "unauthorized"}`))
+		return
+	}
+
+	_, err = auth.ValidateJWT(token, cfg.secretKey)
+	if err != nil {
+		w.Header().Add("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error": "unauthorized"}`))
+		return
+	}
+
 	request := ChirpRequest{}
 
 	decoder := json.NewDecoder(r.Body)
-	err := decoder.Decode(&request)
+	err = decoder.Decode(&request)
 	if err != nil {
 		errRes := ErrorResponse{Error: "Something went wrong"}
 		data, _ := json.Marshal(errRes)
@@ -179,8 +197,14 @@ func (cfg *apiConfig) createUser(w http.ResponseWriter, r *http.Request) {
 	w.Write(jsonResponse)
 }
 
+type UserLogin struct {
+	Email           string `json:"email"`
+	Password        string `json:"password"`
+	ExpiresInSecond *int   `json:"expires_in_seconds"`
+}
+
 func (cfg *apiConfig) loginUser(w http.ResponseWriter, r *http.Request) {
-	request := UserRequest{}
+	request := UserLogin{}
 
 	decoder := json.NewDecoder(r.Body)
 	err := decoder.Decode(&request)
@@ -193,7 +217,7 @@ func (cfg *apiConfig) loginUser(w http.ResponseWriter, r *http.Request) {
 
 	userDB, err := cfg.queries.GetUser(r.Context(), request.Email)
 	if err != nil {
-		if errors.Is(sql.ErrNoRows, err) {
+		if errors.Is(err, sql.ErrNoRows) {
 			w.Header().Add("Content-Type", "application/json")
 			w.WriteHeader(http.StatusNotFound)
 			w.Write([]byte(`"error": "Chirp not found"`))
@@ -221,11 +245,27 @@ func (cfg *apiConfig) loginUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var expiresIn time.Duration
+	if request.ExpiresInSecond != nil {
+		expiresIn = time.Second * time.Duration(*request.ExpiresInSecond)
+	} else {
+		expiresIn = time.Hour * 1
+	}
+
+	token, err := auth.MakeJWT(userDB.ID, cfg.secretKey, expiresIn)
+	if err != nil {
+		w.Header().Add("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`"error" : "Error generating auth token"`))
+		return
+	}
+
 	user := models.User{
 		ID:        userDB.ID,
 		CreatedAt: userDB.CreatedAt,
 		UpdatedAt: userDB.UpdatedAt,
 		Email:     userDB.Email,
+		Token:     token,
 	}
 
 	jsonRes, err := json.Marshal(user)
