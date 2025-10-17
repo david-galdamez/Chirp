@@ -38,11 +38,16 @@ func main() {
 	if secretKey == "" {
 		log.Fatalf("Secret key not found")
 	}
+	polkaKey := os.Getenv("POLKA_KEY")
+	if polkaKey == "" {
+		log.Fatalf("Secret key not found")
+	}
 
 	apiCfg := apiConfig{
 		fileserverHits: atomic.Int32{},
 		queries:        dbQueries,
 		secretKey:      secretKey,
+		polkaKey:       polkaKey,
 	}
 
 	mux.Handle("/api/app/", apiCfg.middlewareMetricsInc(http.StripPrefix("/app", http.FileServer(http.Dir(".")))))
@@ -52,11 +57,15 @@ func main() {
 
 	mux.HandleFunc("POST /api/users", apiCfg.createUser)
 	mux.HandleFunc("POST /api/login", apiCfg.loginUser)
+	mux.HandleFunc("PUT /api/users", apiCfg.updateUser)
+
 	mux.HandleFunc("POST /api/refresh", apiCfg.refreshToken)
 	mux.HandleFunc("POST /api/revoke", apiCfg.revokeToken)
-	mux.HandleFunc("POST /api/chirps", apiCfg.createChirp)
 
-	mux.HandleFunc("PUT /api/users", apiCfg.updateUser)
+	mux.HandleFunc("POST /api/chirps", apiCfg.createChirp)
+	mux.HandleFunc("DELETE /api/chirps/{chirpId}", apiCfg.deleteChirp)
+
+	mux.HandleFunc("POST /api/polka/webhooks", apiCfg.chirpyRed)
 
 	mux.HandleFunc("GET /api/chirps", apiCfg.getChirps)
 	mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.getChirp)

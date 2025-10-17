@@ -16,4 +16,10 @@ DELETE FROM users;
 SELECT * FROM users WHERE email = $1;
 
 -- name: UpdateUser :one
-UPDATE users SET email = $1, hashed_password = $2 WHERE id = $3 RETURNING *;
+UPDATE users SET email = $1, hashed_password = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3 RETURNING *;
+
+-- name: UpdateChirpyRed :exec
+UPDATE users SET is_chirpy_red = TRUE WHERE id = $1;
+
+-- name: GetUserById :one
+SELECT * FROM users WHERE id = $1;

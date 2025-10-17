@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -21,6 +22,7 @@ type apiConfig struct {
 	fileserverHits atomic.Int32
 	queries        *database.Queries
 	secretKey      string
+	polkaKey       string
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -142,8 +144,9 @@ func (cfg *apiConfig) createChirp(w http.ResponseWriter, r *http.Request) {
 }
 
 type UserRequest struct {
-	Email    string `json:"email"`
-	Password string `json:"password"`
+	Email       string `json:"email"`
+	Password    string `json:"password"`
+	IsChirpyRed bool   `json:"is_chirpy_red"`
 }
 
 func (cfg *apiConfig) createUser(w http.ResponseWriter, r *http.Request) {
@@ -178,10 +181,11 @@ func (cfg *apiConfig) createUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	user := models.User{
-		ID:        userDatabase.ID,
-		CreatedAt: userDatabase.CreatedAt,
-		UpdatedAt: userDatabase.UpdatedAt,
-		Email:     userDatabase.Email,
+		ID:          userDatabase.ID,
+		CreatedAt:   userDatabase.CreatedAt,
+		UpdatedAt:   userDatabase.UpdatedAt,
+		Email:       userDatabase.Email,
+		IsChirpyRed: userDatabase.IsChirpyRed,
 	}
 
 	jsonResponse, err := json.Marshal(user)
@@ -277,8 +281,9 @@ func (cfg *apiConfig) loginUser(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:    userDB.CreatedAt,
 		UpdatedAt:    userDB.UpdatedAt,
 		Email:        userDB.Email,
-		Token:        token,
-		RefreshToken: refreshTokenDb.Token,
+		Token:        &token,
+		RefreshToken: &refreshTokenDb.Token,
+		IsChirpyRed:  userDB.IsChirpyRed,
 	}
 
 	jsonRes, err := json.Marshal(user)
@@ -295,12 +300,40 @@ func (cfg *apiConfig) loginUser(w http.ResponseWriter, r *http.Request) {
 }
 
 func (cfg *apiConfig) getChirps(w http.ResponseWriter, r *http.Request) {
-	chirpsDB, err := cfg.queries.GetChirps(r.Context())
-	if err != nil {
-		w.Header().Add("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte(`"error" : "Internal server error"`))
-		return
+
+	var chirpsDB []database.Chirp
+
+	authorId := r.URL.Query().Get("author_id")
+	sortBy := r.URL.Query().Get("sort")
+	if authorId == "" {
+
+		var err error
+		chirpsDB, err = cfg.queries.GetChirps(r.Context())
+		if err != nil {
+			w.Header().Add("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(`"error" : "Internal server error"`))
+			return
+		}
+	} else {
+
+		var err error
+
+		parsedAuthorId, err := uuid.Parse(authorId)
+		if err != nil {
+			w.Header().Add("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(`"error" : "Internal server error"`))
+			return
+		}
+
+		chirpsDB, err = cfg.queries.GetChirpsById(r.Context(), parsedAuthorId)
+		if err != nil {
+			w.Header().Add("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(`"error" : "Internal server error"`))
+			return
+		}
 	}
 
 	chirps := []models.Chirp{}
@@ -314,6 +347,10 @@ func (cfg *apiConfig) getChirps(w http.ResponseWriter, r *http.Request) {
 		}
 
 		chirps = append(chirps, newChirp)
+	}
+
+	if sortBy == "desc" {
+		sort.Slice(chirps, func(i, j int) bool { return chirps[i].CreatedAt.After(chirps[j].CreatedAt) })
 	}
 
 	jsonRes, err := json.Marshal(chirps)
@@ -342,7 +379,7 @@ func (cfg *apiConfig) getChirp(w http.ResponseWriter, r *http.Request) {
 
 	chirpDb, err := cfg.queries.GetChirp(r.Context(), parsedId)
 	if err != nil {
-		if errors.Is(sql.ErrNoRows, err) {
+		if errors.Is(err, sql.ErrNoRows) {
 			w.Header().Add("Content-Type", "application/json")
 			w.WriteHeader(http.StatusNotFound)
 			w.Write([]byte(`"error": "Chirp not found"`))
@@ -431,10 +468,11 @@ type ChangeUserRequest struct {
 }
 
 type UserResponse struct {
-	Id        uuid.UUID `json:"id"`
-	Email     string    `json:"email"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	Id          uuid.UUID `json:"id"`
+	Email       string    `json:"email"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+	IsChirpyRed bool      `json:"is_chirpy_red"`
 }
 
 func (cfg *apiConfig) updateUser(w http.ResponseWriter, r *http.Request) {
@@ -457,7 +495,7 @@ func (cfg *apiConfig) updateUser(w http.ResponseWriter, r *http.Request) {
 	userRequest := ChangeUserRequest{}
 
 	decoder := json.NewDecoder(r.Body)
-	if err := decoder.Decode(userRequest); err != nil {
+	if err := decoder.Decode(&userRequest); err != nil {
 		w.Header().Add("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		w.Write([]byte(`"error" : "Bad request"`))
@@ -484,7 +522,149 @@ func (cfg *apiConfig) updateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	userRes := UserResponse{
+		Id:          userDB.ID,
+		Email:       userDB.Email,
+		CreatedAt:   userDB.CreatedAt,
+		UpdatedAt:   userDB.UpdatedAt,
+		IsChirpyRed: userDB.IsChirpyRed,
+	}
+
+	jsonRes, err := json.Marshal(userRes)
+	if err != nil {
+		w.Header().Add("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`"error" : "Internal server error"`))
+		return
+	}
+
 	w.Header().Add("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	w.Write()
+	w.Write(jsonRes)
+}
+
+func (cfg *apiConfig) deleteChirp(w http.ResponseWriter, r *http.Request) {
+	chirpId := r.PathValue("chirpID")
+	if chirpId == "" {
+		w.Header().Add("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`"error" : "Chirp id not provided"`))
+		return
+	}
+
+	token, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		w.Header().Add("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`"error" : "unauthorized"`))
+		return
+	}
+
+	userId, err := auth.ValidateJWT(token, cfg.secretKey)
+	if err != nil {
+		w.Header().Add("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`"error" : "bad format from chirp id"`))
+		return
+	}
+
+	parsedId, err := uuid.Parse(chirpId)
+	if err != nil {
+		w.Header().Add("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`"error" : "bad format from chirp id"`))
+		return
+	}
+
+	chirp, err := cfg.queries.GetChirp(r.Context(), parsedId)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			w.Header().Add("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte(`"error" : "chirp not found"`))
+			return
+		}
+		w.Header().Add("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`"error" : "Internal server error"`))
+		return
+	}
+
+	if chirp.UserID != userId {
+		w.Header().Add("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(`"error" : "chirp does not belongs to user"`))
+		return
+	}
+
+	if err := cfg.queries.DeleteChirp(r.Context(), chirp.ID); err != nil {
+		w.Header().Add("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`"error" : "Internal server error"`))
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+type WebHookReq struct {
+	Event string            `json:"event"`
+	Data  map[string]string `json:"data"`
+}
+
+func (cfg *apiConfig) chirpyRed(w http.ResponseWriter, r *http.Request) {
+
+	apiKey, err := auth.GetAPIKey(r.Header)
+	if err != nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	if apiKey != cfg.polkaKey {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	req := WebHookReq{}
+
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(&req); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	if req.Event != "user.upgrade" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	userId := req.Data["user_id"]
+	if userId == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	parsedId, err := uuid.Parse(userId)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	_, err = cfg.queries.GetUserById(r.Context(), parsedId)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	if err := cfg.queries.UpdateChirpyRed(r.Context(), parsedId); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
